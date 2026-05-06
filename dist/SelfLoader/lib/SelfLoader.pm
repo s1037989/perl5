@@ -2,6 +2,7 @@ package SelfLoader;
 use 5.008;
 use strict;
 use IO::Handle;
+use Fcntl qw(SEEK_CUR SEEK_SET);
 our $VERSION = "1.29";
 
 # The following bit of eval-magic is necessary to make this work on
@@ -98,14 +99,29 @@ sub _load_stubs {
     croak("$callpack doesn't contain an __DATA__ token")
         unless defined fileno($fh);
     # Protect: fork() shares the file pointer between the parent and the kid
-    if(seek($fh, tell($fh), 0)) {
-      open my $nfh, '<&', $fh or croak "reopen: $!";# dup() the fd
-      close $fh or die "close: $!";                 # autocloses, but be
-                                                    # paranoid
-      open $fh, '<&', $nfh or croak "reopen2: $!";  # dup() the fd "back"
-      close $nfh or die "close after reopen: $!";   # autocloses, but be
-                                                    # paranoid
-      $fh->untaint;
+    # but the buffer isn't shared
+    # Fetch the position as adjusted for any buffered data.
+    # Raw seeking this handle can confuse some glibc versions own
+    # adjustment on fclose with PERLIO=stdio
+    my $fdpos = sysseek($fh, 0, SEEK_CUR);
+    # we don't want to actually move the pointer here,
+    # stdio glibc fclose() might try to commit the fd position plus
+    # buffer offset into the fd position, and moving the fd
+    # position can confuse that.
+    # This is only useful for seekable handles
+    if ($fdpos && sysseek($fh, $fdpos, SEEK_SET)) {
+        my $realpos = tell($fh);
+        open my $nfh, '<&', $fh or croak "reopen: $!";# dup() the fd
+        close $fh or die "close: $!";                 # autocloses, but be
+                                                      # paranoid
+        open $fh, '<&', $nfh or croak "reopen2: $!";  # dup() the fd "back"
+        close $nfh or die "close after reopen: $!";   # autocloses, but be
+                                                      # paranoid
+        $fh->untaint;
+        # the new handle should have no buffered data, so a raw seek should
+        # be safe
+        sysseek($fh, $realpos, SEEK_SET)
+          or croak "Cannot see cloned handle to original position: $!";
     }
     $Cache{"${currpack}::<DATA"} = 1;   # indicate package is cached
 
